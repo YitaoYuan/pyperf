@@ -70,6 +70,7 @@ def usage():
     print("    -s <ip addr>         Run server.")
     print("    -c <ip addr>         Run client.")
     print("    -p <port>            Set server port, the default value is 40009.")
+    print("    -P <nthread>         Set number of threads, the default value is 1.")
     print("    -h, --help           Show this help.")
     print("Options for server:")
     print("    --ACK                Send an ACK for every packet, note that ")
@@ -77,15 +78,15 @@ def usage():
     print("                         nor check the content of ACK packet.")
     print("Options for client:")
     print("    -M <MTU>             Set MTU, the default value is 1300.")
-    print("    -P <nthread>         Set number of threads, the default value is 1.")
-    print("    -t <time>            Set time to stop (in seconds, can be a decimal), ")
+    print("    -t <time>            Set time to stop (in seconds), ")
+    print("    -n <cnt>             Packets to send for each thread")
     print("                         by default the process loops indefinitely.")
+    print("    --quiet              Do not print.")
     
 
 
-def run_server(server_socket, ACK_flag):
+def run_server(server_socket, ACK_flag, counter):
     old_time = time.time()
-    counter = packet_counter("server")
     while True: 
         new_time = time.time()
         if new_time - old_time >= 1:
@@ -103,8 +104,10 @@ def run_server(server_socket, ACK_flag):
 
 force_quit = False
 
-def run_client_tx(client_socket, server_addr, client_id, msg_len, counter):
+def run_client_tx(client_socket, server_addr, client_id, msg_len, counter, num_to_send):
     while not force_quit:
+        if num_to_send > 0 and counter.read()[0] >= num_to_send:
+            break
         msg = "{}-{}".format(client_id, counter.read()[0])
         fill_num = msg_len - len(msg)
         if fill_num <= 0:
@@ -154,14 +157,16 @@ def main():
     MTU = 1300
     nthread = 1
     time_to_stop = -1
+    num_to_send = -1
 
+    # TODO: use argparse instead of getopt
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "s:c:p:hM:P:t:", ["help", "ACK"])
+        opts, args = getopt.getopt(sys.argv[1:], "s:c:p:hM:P:t:n:", ["help", "ACK", "quiet"])
     except getopt.GetoptError:
         usage()
         os._exit(1)
     
-    help_flag = server_flag = client_flag = ACK_flag = False
+    help_flag = server_flag = client_flag = ACK_flag = quiet_flag = False
 
     for opt, arg in opts:
         if opt in ["-h", "--help"]:
@@ -180,12 +185,17 @@ def main():
             assert(50 <= MTU and MTU <= 1500)
         elif opt == "-P":
             nthread = int(arg)
-            assert(0 < nthread and nthread <= 100)
+            assert(0 < nthread and nthread <= 1000)
         elif opt == "-t":
             time_to_stop = float(arg)
             assert(0 < time_to_stop and time_to_stop <= 3600)
+        elif opt == "-n":
+            num_to_send = int(arg)
+            assert(0 < num_to_send)
         elif opt == "--ACK":
             ACK_flag = True
+        elif opt == "--quiet":
+            quiet_flag = True
         
     if (not server_flag and not client_flag) or (server_flag and client_flag):
         usage()
@@ -197,16 +207,22 @@ def main():
         signal.signal(signal.SIGINT, server_sig_handler)
         signal.signal(signal.SIGTERM, server_sig_handler)
 
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server_counter = [packet_counter("server"+str(i)) for i in range(nthread)]
+        server_socket = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for i in range(nthread)]
         try:
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind(server_addr)
-            server_socket.settimeout(0.1)
+            for s_socket in server_socket:
+                s_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s_socket.bind(server_addr)
+                s_socket.settimeout(0.1)
         except:
             print("Cannot bind {}.".format(server_addr))
             os._exit(1)
 
-        run_server(server_socket, ACK_flag)
+        threads = [threading.Thread(target = run_server, args = (server_socket[i], ACK_flag, server_counter[i])) for i in range(nthread)]
+
+        for thread in threads:
+            thread.start()
+
     else:
         signal.signal(signal.SIGINT, client_sig_handler)
         signal.signal(signal.SIGTERM, client_sig_handler)
@@ -217,7 +233,7 @@ def main():
         for c_socket in client_socket:
             c_socket.settimeout(0.1)
 
-        threads = [threading.Thread(target = run_client_tx, args = (client_socket[i], server_addr, i, MTU - MTU_overhead, tx_counter[i])) for i in range(nthread)]
+        threads = [threading.Thread(target = run_client_tx, args = (client_socket[i], server_addr, i, MTU - MTU_overhead, tx_counter[i], num_to_send)) for i in range(nthread)]
         threads += [threading.Thread(target = run_client_rx, args = (client_socket[i], server_addr, i, MTU - MTU_overhead, rx_counter[i])) for i in range(nthread)]
         
         start_time = time.time()
@@ -236,9 +252,13 @@ def main():
             except:
                 pass
             new_time = time.time()
-            for i in range(nthread):
-                print(tx_counter[i])
-                print(rx_counter[i])
+            if not quiet_flag:
+                for i in range(nthread):
+                    print(tx_counter[i])
+                    print(rx_counter[i])
+            num_alive = sum(int(thread.is_alive()) for thread in threads[:nthread]) # only query TX threads
+            if num_alive == 0:
+                break
 
         force_quit = True
         
